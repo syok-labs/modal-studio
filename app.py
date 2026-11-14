@@ -10,6 +10,8 @@ Rooms today:
   lipsync - LongCat-Video-Avatar 1.5 (MIT): one photo + a voice recording -> a talking video, lips in sync
   wanhd - Wan 2.2 A14B, the best-looking room: text or picture to video, slow and costly but sharp,
           honours a "do not show" (negative) prompt. 5 s clip, 16 frames per second.
+  headswap - BFS head swap on LTX-2.3: a clip + one face photo per person (up to 4, matched to the heads left to right).
+          Heads are tracked and swapped one by one at a fixed size, then fitted back to the original head's size and position.
 
 Deploy:        modal deploy app.py
 First time:    modal run app.py::fetch_ltx    (downloads LTX-2 on a cheap CPU, not the GPU)
@@ -100,8 +102,11 @@ longcat_image = (
 headswap_image = (
     modal.Image.debian_slim(python_version="3.12")
     .apt_install("ffmpeg", "git")
-    .pip_install("torch==2.8.0", "torchvision==0.23.0", "torchaudio==2.8.0", "pillow", "numpy", "huggingface_hub", "av")
-    .run_commands("git clone --depth 1 https://github.com/Lightricks/LTX-2 /opt/ltx2",
+    .pip_install("torch==2.8.0", "torchvision==0.23.0", "torchaudio==2.8.0", "pillow", "numpy", "huggingface_hub", "av",
+                 "opencv-python-headless")
+    .run_commands("python -c \"import urllib.request as u; u.urlretrieve('https://huggingface.co/opencv/face_detection_yunet/resolve/main/face_detection_yunet_2023mar.onnx', '/opt/yunet.onnx')\"",
+                  "test $(stat -c %s /opt/yunet.onnx) -gt 100000",
+                  "git clone --depth 1 https://github.com/Lightricks/LTX-2 /opt/ltx2",
                   "cd /opt/ltx2 && pip install -e packages/ltx-core -e packages/ltx-pipelines")
     .env({"HF_HOME": CACHE})
 )
@@ -476,29 +481,265 @@ def fetch_headswap():
     return "head-swap weights downloaded"
 
 
+# ---------------------------------------------------------------------------------------------
+# Head swap helpers (CPU only). The clip is never swapped as a whole: every head is found and tracked, cut out as a
+# head-sized square, swapped there (BFS works best when the head is a fixed size in the picture), then moved and scaled
+# so the new head sits exactly where the old one was, and blended back into the original frames. Several people in one
+# scene are swapped one after another, left to right.
+# ---------------------------------------------------------------------------------------------
+HS_CROPK = 3.0     # a head crop is 3 face-heights wide: head, hair and the top of the shoulders
+HS_REFK = 1.7      # the reference photo is cut to 1.7 face-heights: hair to chin
+HS_MAX_PEOPLE = 4
+HS_YUNET = "/opt/yunet.onnx"
+HS_YUNET_URL = "https://huggingface.co/opencv/face_detection_yunet/resolve/main/face_detection_yunet_2023mar.onnx"
+
+
+def hs_faces(frame_bgr, detector=None):
+    """Every face in one frame as (x, y, w, h, score), in pixels."""
+    import cv2
+
+    h, w = frame_bgr.shape[:2]
+    det = detector or cv2.FaceDetectorYN.create(HS_YUNET, "", (w, h), 0.5, 0.3, 5000)
+    det.setInputSize((w, h))
+    _, rows = det.detect(frame_bgr)
+    # (x, y, w, h, score, landmarks): landmarks are the two eyes, the nose tip and the two mouth corners as 10 numbers
+    return [] if rows is None else [(float(r[0]), float(r[1]), float(r[2]), float(r[3]), float(r[-1]), [float(v) for v in r[4:14]]) for r in rows]
+
+
+def _hs_smooth(a, k=9):
+    import numpy as np
+
+    a = np.asarray(a, dtype=np.float64)
+    if len(a) < 3:
+        return a
+    k = min(k, len(a) // 2 * 2 + 1)
+    pad = np.pad(a, (k // 2, k // 2), mode="edge")
+    return np.convolve(pad, np.ones(k) / k, mode="valid")
+
+
+def hs_tracks(dets, n):
+    """Follow each face through the clip. dets[i] = faces of frame i. Returns one dict per person, left to right:
+    "box" = (n, 4) smooth (centre x, centre y, width, height) used to cut the head crop, "lm" = (n, 10) lightly smoothed face landmarks.
+    Gaps are filled in, tiny false hits are dropped."""
+    import numpy as np
+
+    tracks = []
+    for i, faces in enumerate(dets):
+        pairs = []
+        for ti, t in enumerate(tracks):
+            if i - t["last_i"] > 10:
+                continue
+            lx, ly, lw, lh = t["last"]
+            for fi, f in enumerate(faces):
+                fx, fy = f[0] + f[2] / 2, f[1] + f[3] / 2
+                dist = ((fx - lx) ** 2 + (fy - ly) ** 2) ** 0.5
+                if dist < 0.8 * max(lh, f[3]):
+                    pairs.append((dist, ti, fi))
+        pairs.sort()
+        taken_t, taken_f = set(), set()
+        for _, ti, fi in pairs:
+            if ti in taken_t or fi in taken_f:
+                continue
+            taken_t.add(ti)
+            taken_f.add(fi)
+            f = faces[fi]
+            box = (f[0] + f[2] / 2, f[1] + f[3] / 2, f[2], f[3])
+            tracks[ti]["boxes"][i] = box + tuple(f[5])
+            tracks[ti]["last"], tracks[ti]["last_i"] = box, i
+        for fi, f in enumerate(faces):
+            if fi not in taken_f and f[4] >= 0.6:
+                box = (f[0] + f[2] / 2, f[1] + f[3] / 2, f[2], f[3])
+                tracks.append({"boxes": {i: box + tuple(f[5])}, "last": box, "last_i": i})
+    keep = [t for t in tracks if len(t["boxes"]) >= max(4, int(0.2 * n))]
+    out = []
+    xs = np.arange(n)
+    for t in keep:
+        idx = np.array(sorted(t["boxes"]))
+        arr = np.array([t["boxes"][i] for i in idx])
+        cx = _hs_smooth(np.interp(xs, idx, arr[:, 0]))
+        cy = _hs_smooth(np.interp(xs, idx, arr[:, 1]))
+        h = np.exp(_hs_smooth(np.interp(xs, idx, np.log(arr[:, 3]))))
+        ratio = float(np.median(arr[:, 2] / arr[:, 3]))
+        lm = np.stack([_hs_smooth(np.interp(xs, idx, arr[:, 4 + j]), 5) for j in range(10)], axis=1)
+        out.append({"box": np.stack([cx, cy, h * ratio, h], axis=1), "lm": lm})
+    out.sort(key=lambda t: float(np.median(t["box"][:, 0])))
+    return out
+
+
+def hs_crop_matrix(box, R):
+    """Affine matrix (source -> R x R head crop) that puts the face at a fixed size in the middle of the crop."""
+    import numpy as np
+
+    cx, cy, _, fh = box
+    r = R / (HS_CROPK * fh)
+    cy0 = cy - 0.12 * fh      # head centre sits a little above the middle of the face box
+    return np.array([[r, 0, R / 2 - r * cx], [0, r, R / 2 - r * cy0]], dtype=np.float64)
+
+
+def hs_reference(photo_bgr, side, detector=None):
+    """The new face: cut the head out of the photo (hair to chin) and return a side x side picture (BGR)."""
+    import cv2
+    import numpy as np
+
+    h, w = photo_bgr.shape[:2]
+    faces = hs_faces(photo_bgr, detector)
+    if faces:
+        x, y, fw, fh = max(faces, key=lambda f: f[2] * f[3])[:4]
+        cx, cy, s = x + fw / 2, y + fh / 2 - 0.1 * fh, HS_REFK * fh
+    else:   # no face found: use the middle of the photo
+        cx, cy, s = w / 2, h / 2, min(w, h)
+    r = side / s
+    m = np.array([[r, 0, side / 2 - r * cx], [0, r, side / 2 - r * cy]], dtype=np.float64)
+    return cv2.warpAffine(photo_bgr, m, (side, side), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
+
+
+def hs_gen_landmarks(gen_frames_bgr, R, detector=None):
+    """Where are the face landmarks of the (single) swapped face in each generated crop? Gaps are filled in. (n, 10) or None."""
+    import numpy as np
+
+    n = len(gen_frames_bgr)
+    pts = {}
+    for i, fr in enumerate(gen_frames_bgr):
+        faces = hs_faces(fr, detector)
+        if faces:
+            f = min(faces, key=lambda f: (f[0] + f[2] / 2 - R / 2) ** 2 + (f[1] + f[3] / 2 - R / 2) ** 2)
+            pts[i] = f[5]
+    if len(pts) < max(3, n // 5):
+        return None
+    idx = np.array(sorted(pts))
+    arr = np.array([pts[i] for i in idx])
+    xs = np.arange(n)
+    return np.stack([_hs_smooth(np.interp(xs, idx, arr[:, j]), 5) for j in range(10)], axis=1)
+
+
+def hs_mask(R):
+    """Soft egg-shaped blend mask (just the head: face, hair and chin, never the shoulders or the background) in head-crop coordinates (1 = new head, 0 = original)."""
+    import cv2
+    import numpy as np
+
+    fhc = R / HS_CROPK
+    m = np.zeros((R, R), np.float32)
+    cv2.ellipse(m, (R // 2, R // 2 - int(0.12 * fhc)), (int(0.68 * fhc), int(0.92 * fhc)), 0, 0, 360, 1.0, -1)
+    s = max(3, int(0.2 * fhc)) | 1
+    return np.clip(cv2.GaussianBlur(m, (s * 2 + 1, s * 2 + 1), s / 2.0), 0, 1)
+
+
+def hs_blend(frames, track, gen_crops, gen_lm, R, mask):
+    """Put the swapped head of one person back into every frame (in place). frames: list of BGR uint8 arrays, track: that
+    person's track from hs_tracks, gen_crops: the generated R x R BGR crops, gen_lm: face landmarks found in those crops (or None).
+    The new head is turned, scaled and moved so its eyes, nose and mouth land on the old ones, then blended in with a soft mask."""
+    import cv2
+    import numpy as np
+
+    n = len(frames)
+    H, W = frames[0].shape[:2]
+    fhc = R / HS_CROPK
+    boxes, lms = track["box"], track["lm"]
+    mats = [hs_crop_matrix(boxes[i], R) for i in range(n)]
+    aligns = None
+    if gen_lm is not None:   # similarity transform (scale, turn, shift) per frame, then smoothed over time
+        p = np.zeros((n, 4))
+        for i in range(n):
+            src = (mats[i][:, :2] @ lms[i].reshape(5, 2).T + mats[i][:, 2:3]).T   # old landmarks in head-crop coordinates
+            m, _ = cv2.estimateAffinePartial2D(gen_lm[i].reshape(5, 2).astype(np.float32), src.astype(np.float32), method=cv2.LMEDS)
+            if m is None:
+                m = np.array([[1, 0, 0], [0, 1, 0]], dtype=np.float64)
+            sc = float(np.hypot(m[0, 0], m[1, 0]))
+            if not 0.5 <= sc <= 1.8 or abs(np.degrees(np.arctan2(m[1, 0], m[0, 0]))) > 35:
+                m = np.array([[1, 0, 0], [0, 1, 0]], dtype=np.float64)
+            p[i] = (m[0, 0], m[1, 0], m[0, 2], m[1, 2])
+        p = np.stack([_hs_smooth(p[:, j], 5) for j in range(4)], axis=1)
+        aligns = [np.array([[a, -b, tx], [b, a, ty]], dtype=np.float64) for a, b, tx, ty in p]
+    offs = np.zeros((n, 3))
+    jobs = []
+    for i in range(n):
+        inv = cv2.invertAffineTransform(mats[i])
+        g = gen_crops[i]
+        mk = mask
+        if aligns is not None:
+            g = cv2.warpAffine(g, aligns[i], (R, R), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
+            ok = cv2.warpAffine(np.ones((R, R), np.float32), aligns[i], (R, R), flags=cv2.INTER_LINEAR, borderValue=0)
+            ok = cv2.GaussianBlur(cv2.erode(ok, np.ones((7, 7), np.uint8)), (15, 15), 0)   # never blend pixels that were stretched in from outside the picture
+            mk = mask * ok
+        gw = cv2.warpAffine(g, inv, (W, H), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
+        mw = cv2.warpAffine(mk, inv, (W, H), flags=cv2.INTER_LINEAR)
+        ring = (mw > 0.08) & (mw < 0.5)
+        if ring.sum() > 400:   # light correction so the head's tones follow the scene (kept small)
+            offs[i] = frames[i][ring].mean(0) - gw[ring].mean(0)
+        jobs.append((gw, mw))
+    for j in range(3):
+        offs[:, j] = _hs_smooth(offs[:, j], 9)
+    offs = np.clip(offs * 0.6, -14, 14)
+    for i, (gw, mw) in enumerate(jobs):
+        gf = np.clip(gw.astype(np.float32) + offs[i], 0, 255)
+        a = mw[..., None]
+        frames[i][:] = np.clip(frames[i].astype(np.float32) * (1 - a) + gf * a, 0, 255).astype(np.uint8)
+
+
 @app.cls(
     image=headswap_image,
     gpu=HEADSWAP_GPU,
     volumes={CACHE: cache},
     scaledown_window=SCALEDOWN_SECONDS,
-    timeout=40 * 60,
+    timeout=60 * 60,
     max_containers=1,
 )
 class Headswap:
+    def _bfs(self, work, guide, prompt, cw, ch, frames, out):
+        """One BFS run: the guide video (new face on the left strip, head crop on the right) -> the swapped video."""
+        import subprocess
+
+        # BFS ships its LoRA with ComfyUI names (lora_down / lora_up); the official pipeline reads lora_A / lora_B.
+        # Convert once and keep the result on the volume. The small bias and norm "diff" tensors are not LoRA factors and are left out.
+        lora = f"{HEADSWAP_DIR}/bfs_v3_peft.safetensors"
+        if not os.path.exists(lora):
+            from safetensors.torch import load_file, save_file
+            src = load_file(f"{HEADSWAP_DIR}/{HEADSWAP_LORA[1]}")
+            dst = {k.replace(".lora_down.weight", ".lora_A.weight").replace(".lora_up.weight", ".lora_B.weight"): v.contiguous()
+                   for k, v in src.items() if ".lora_down.weight" in k or ".lora_up.weight" in k}
+            save_file(dst, lora + ".tmp")
+            os.replace(lora + ".tmp", lora)
+            cache.commit()
+        if os.path.exists(out):
+            os.remove(out)
+        cmd = ["python", "-m", "ltx_pipelines.ic_lora",
+               "--distilled-checkpoint-path", f"{HEADSWAP_DIR}/{HEADSWAP_CKPT[1]}",
+               "--gemma-root", f"{HEADSWAP_DIR}/gemma",
+               "--spatial-upsampler-path", f"{HEADSWAP_DIR}/{HEADSWAP_UP[1]}",
+               "--lora", lora, "1.0",
+               "--video-conditioning", guide, "1.0",
+               "--prompt", prompt, "--height", str(ch), "--width", str(cw),
+               "--num-frames", str(frames), "--frame-rate", str(FPS),
+               "--seed", str(int.from_bytes(os.urandom(3), "big")),
+               "--quantization", "fp8-cast", "--output-path", out]
+        r = subprocess.run(cmd, cwd="/opt/ltx2", capture_output=True, text=True)
+        if r.returncode != 0 or not os.path.exists(out):
+            keep = [ln for ln in ((r.stderr or "") + "\n" + (r.stdout or "")).splitlines()
+                    if ln.strip() and "nanobind" not in ln and "leaked" not in ln and not ln.startswith(" - ")]
+            raise RuntimeError(f"head swap failed (exit {r.returncode}): " + "\n".join(keep)[-1500:])
+
     @modal.method()
-    def make(self, prompt: str, video_b64: str, image_b64: str, seconds: int = 5, quality: str = "fast") -> bytes:
+    def make(self, prompt: str, video_b64: str, images_b64: list, seconds: int = 5, quality: str = "fast") -> bytes:
         import shutil
         import subprocess
 
+        import cv2
         import numpy as np
-        from PIL import Image
 
         work = "/tmp/headswap"
         shutil.rmtree(work, ignore_errors=True)
         os.makedirs(work)
         with open(f"{work}/in.bin", "wb") as fh:
             fh.write(base64.b64decode(video_b64))
-        face = Image.open(io.BytesIO(base64.b64decode(image_b64))).convert("RGB")
+        photos = []
+        for b in (images_b64 or [])[:HS_MAX_PEOPLE]:
+            arr = np.frombuffer(base64.b64decode(b), np.uint8)
+            img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+            if img is None:
+                raise RuntimeError("one of the face photos could not be read (use a JPG or PNG)")
+            photos.append(img)
+        if not photos:
+            raise RuntimeError("add at least one photo of the new face")
 
         def run(cmd):
             r = subprocess.run(cmd, capture_output=True, text=True)
@@ -511,98 +752,83 @@ class Headswap:
         sw, sh = int(info[0]), int(info[1])
         has_audio = bool(run(["ffprobe", "-v", "error", "-select_streams", "a", "-show_entries",
                               "stream=index", "-of", "csv=p=0", f"{work}/in.bin"]).strip())
-        # the clip is shrunk so its long side is 768 (1024 for hd); the model wants sides divisible by 64
-        long_side = 1024 if quality == "hd" else 768
-        k = long_side / max(sw, sh)
-        cw, ch = max(64, round(sw * k / 64) * 64), max(64, round(sh * k / 64) * 64)
+        # the scene is worked on at most 1280 pixels on its long side; the head crops are what the model sees
+        k = min(1.0, 1280 / max(sw, sh))
+        W, H = max(2, round(sw * k / 2) * 2), max(2, round(sh * k / 2) * 2)
         seconds = max(1, min(HEADSWAP_MAX_SECONDS, seconds))
-        frames = 8 * int(FPS * seconds // 8) + 1
-        # the guide video: the clip on the right, a green side strip on the left holding the new face on every frame
-        strip = round(cw * 0.25 / 8) * 8
-        area_w, area_h = cw - strip, ch
-        fit = min(area_w / cw, area_h / ch)
-        vw, vh = max(2, round(cw * fit / 2) * 2), max(2, round(ch * fit / 2) * 2)
-        vx, vy = strip, (ch - vh) // 2
-        pad = 12
-        fw, fh = face.size
-        fk = min((strip - 2 * pad) / fw, (ch - 2 * pad) / fh)
-        face = face.resize((max(1, round(fw * fk)), max(1, round(fh * fk))), Image.LANCZOS)
-        base = Image.new("RGB", (cw, ch), (0, 0, 0))
-        base.paste(Image.new("RGB", (strip, ch), (0, 255, 0)), (0, 0))
-        base.paste(face, ((strip - face.size[0]) // 2, (ch - face.size[1]) // 2))
-        base_arr = np.array(base)
-        reader = subprocess.Popen(
+        want = 8 * int(FPS * seconds // 8) + 1
+        raw = subprocess.run(
             ["ffmpeg", "-v", "error", "-i", f"{work}/in.bin", "-t", str(seconds), "-r", str(FPS),
-             "-vf", f"scale={vw}:{vh}:flags=lanczos", "-frames:v", str(frames), "-f", "rawvideo", "-pix_fmt", "rgb24", "-"],
-            stdout=subprocess.PIPE)
-        writer = subprocess.Popen(
-            ["ffmpeg", "-y", "-v", "error", "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{cw}x{ch}", "-r", str(FPS),
-             "-i", "-", "-c:v", "libx264", "-crf", "14", "-pix_fmt", "yuv420p", f"{work}/guide.mp4"],
-            stdin=subprocess.PIPE)
-        count = 0
-        fsize = vw * vh * 3
-        last = None
-        while True:
-            buf = reader.stdout.read(fsize)
-            if len(buf) < fsize:
-                break
-            fr = base_arr.copy()
-            fr[vy:vy + vh, vx:vx + vw] = np.frombuffer(buf, np.uint8).reshape(vh, vw, 3)
-            writer.stdin.write(fr.tobytes())
-            last = fr
-            count += 1
-        # pad a short clip by holding its last frame, so the frame count fits the model (8 x n + 1)
-        while last is not None and count < frames:
-            writer.stdin.write(last.tobytes())
-            count += 1
-        writer.stdin.close()
-        writer.wait()
-        reader.wait()
-        if count < 9:
+             "-vf", f"scale={W}:{H}:flags=lanczos", "-frames:v", str(want), "-f", "rawvideo", "-pix_fmt", "bgr24", "-"],
+            capture_output=True).stdout
+        fsz = W * H * 3
+        frames = [np.frombuffer(raw[i * fsz:(i + 1) * fsz], np.uint8).reshape(H, W, 3).copy() for i in range(len(raw) // fsz)]
+        if len(frames) < 9:
             raise RuntimeError("the clip is too short (needs about half a second)")
-        frames = 8 * ((count - 1) // 8) + 1
+        while (len(frames) - 1) % 8:   # the model wants 8 x n + 1 frames: hold the last frame a moment
+            frames.append(frames[-1].copy())
+        n = len(frames)
 
+        det = cv2.FaceDetectorYN.create(HS_YUNET, "", (W, H), 0.5, 0.3, 5000)
+        dets = [hs_faces(f, det) for f in frames]
+        tracks = hs_tracks(dets, n)
+        if not tracks:
+            raise RuntimeError("no face found in the clip. Use a clip where the face is clearly visible (not tiny, not turned away).")
+        if len(photos) > len(tracks):
+            raise RuntimeError(f"found {len(tracks)} {'person' if len(tracks) == 1 else 'people'} in the clip but you gave {len(photos)} photos. "
+                               "Remove the extra photos, or use a clip where every head is clearly visible.")
         if not prompt.lstrip().lower().startswith("head_swap"):
             prompt = ("head_swap:\nFACE:\n" + prompt.strip() +
                       "\n\nACTION:\nA person performs the same movements as in the video.")
-        # BFS ships its LoRA with ComfyUI names (lora_down / lora_up); the official pipeline reads lora_A / lora_B.
-        # Convert once and keep the result on the volume. The small bias and norm "diff" tensors are not LoRA factors and are left out.
-        lora = f"{HEADSWAP_DIR}/bfs_v3_peft.safetensors"
-        if not os.path.exists(lora):
-            from safetensors.torch import load_file, save_file
-            src = load_file(f"{HEADSWAP_DIR}/{HEADSWAP_LORA[1]}")
-            dst = {k.replace(".lora_down.weight", ".lora_A.weight").replace(".lora_up.weight", ".lora_B.weight"): v.contiguous()
-                   for k, v in src.items() if ".lora_down.weight" in k or ".lora_up.weight" in k}
-            save_file(dst, lora + ".tmp")
-            os.replace(lora + ".tmp", lora)
-            cache.commit()
-        out = f"{work}/out.mp4"
-        cmd = ["python", "-m", "ltx_pipelines.ic_lora",
-               "--distilled-checkpoint-path", f"{HEADSWAP_DIR}/{HEADSWAP_CKPT[1]}",
-               "--gemma-root", f"{HEADSWAP_DIR}/gemma",
-               "--spatial-upsampler-path", f"{HEADSWAP_DIR}/{HEADSWAP_UP[1]}",
-               "--lora", lora, "1.0",
-               "--video-conditioning", f"{work}/guide.mp4", "1.0",
-               "--prompt", prompt, "--height", str(ch), "--width", str(cw),
-               "--num-frames", str(frames), "--frame-rate", str(FPS),
-               "--seed", str(int.from_bytes(os.urandom(3), "big")),
-               "--quantization", "fp8-cast", "--output-path", out]
-        r = subprocess.run(cmd, cwd="/opt/ltx2", capture_output=True, text=True)
-        if r.returncode != 0 or not os.path.exists(out):
-            keep = [ln for ln in ((r.stderr or "") + "\n" + (r.stdout or "")).splitlines()
-                    if ln.strip() and "nanobind" not in ln and "leaked" not in ln and not ln.startswith(" - ")]
-            raise RuntimeError(f"head swap failed (exit {r.returncode}): " + "\n".join(keep)[-1500:])
-        # keep only the video area (the green strip is cut off), bring it back to the clip's own shape and sound
+        R = 768 if quality == "hd" else 576
+        strip = R // 3                      # the green side strip is a quarter of the canvas
+        cw, ch = strip + R, R
+        mask = hs_mask(R)
+        source = [f.copy() for f in frames] if len(photos) > 1 else frames
+        for who, photo in enumerate(photos):   # people are numbered left to right
+            track = tracks[who]
+            tbox = track["box"]
+            ref = hs_reference(photo, strip - 24, det)
+            canvas = np.zeros((ch, cw, 3), np.uint8)
+            canvas[:, :strip] = (0, 255, 0)
+            y0 = (ch - ref.shape[0]) // 2
+            canvas[y0:y0 + ref.shape[0], 12:12 + ref.shape[1]] = ref
+            writer = subprocess.Popen(
+                ["ffmpeg", "-y", "-v", "error", "-f", "rawvideo", "-pix_fmt", "bgr24", "-s", f"{cw}x{ch}", "-r", str(FPS),
+                 "-i", "-", "-c:v", "libx264", "-crf", "14", "-pix_fmt", "yuv420p", f"{work}/guide{who}.mp4"],
+                stdin=subprocess.PIPE)
+            for i in range(n):
+                m = hs_crop_matrix(tbox[i], R)
+                canvas[:, strip:] = cv2.warpAffine(source[i], m, (R, R), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
+                writer.stdin.write(canvas.tobytes())
+            writer.stdin.close()
+            writer.wait()
+            self._bfs(work, f"{work}/guide{who}.mp4", prompt, cw, ch, n, f"{work}/out{who}.mp4")
+            gen = subprocess.run(["ffmpeg", "-v", "error", "-i", f"{work}/out{who}.mp4", "-f", "rawvideo", "-pix_fmt", "bgr24", "-"],
+                                 capture_output=True).stdout
+            gsz = cw * ch * 3
+            crops = [np.frombuffer(gen[i * gsz:(i + 1) * gsz], np.uint8).reshape(ch, cw, 3)[:, strip:].copy() for i in range(len(gen) // gsz)]
+            if len(crops) < n:
+                raise RuntimeError("the model returned a shorter video than expected")
+            glm = hs_gen_landmarks(crops[:n], R, det)
+            hs_blend(frames, track, crops[:n], glm, R, mask)
+
+        raw_out = f"{work}/raw.mp4"
+        enc = subprocess.Popen(
+            ["ffmpeg", "-y", "-v", "error", "-f", "rawvideo", "-pix_fmt", "bgr24", "-s", f"{W}x{H}", "-r", str(FPS),
+             "-i", "-", "-c:v", "libx264", "-crf", "17", "-pix_fmt", "yuv420p", raw_out], stdin=subprocess.PIPE)
+        for f in frames:
+            enc.stdin.write(f.tobytes())
+        enc.stdin.close()
+        enc.wait()
         final = f"{work}/final.mp4"
-        crop = f"crop={vw}:{vh}:{vx}:{vy},scale={round(sw * k / 2) * 2}:{round(sh * k / 2) * 2}:flags=lanczos"
-        fc = ["ffmpeg", "-y", "-v", "error", "-i", out]
+        fc = ["ffmpeg", "-y", "-v", "error", "-i", raw_out]
         if has_audio:
             fc += ["-i", f"{work}/in.bin", "-map", "0:v", "-map", "1:a?", "-shortest"]
-        fc += ["-vf", crop, "-c:v", "libx264", "-crf", "17", "-pix_fmt", "yuv420p", "-c:a", "aac", final]
+        fc += ["-c:v", "copy", "-c:a", "aac", final]
         run(fc)
         with open(final, "rb") as fh:
             return fh.read()
-
 
 
 @app.function(
@@ -633,6 +859,7 @@ def gateway():
         ratio: str = "16:9"
         quality: str = "fast"
         audio: str | None = None  # room lipsync only: the voice recording (data: URL), 15 s are used at most
+        images: list[str] | None = None  # room headswap only: one new-face photo per person in the clip, left to right
         negative_prompt: str | None = None  # "do not show" list (Wan rooms; LTX distilled ignores it)
 
     def raw(x, limit):
@@ -658,7 +885,7 @@ def gateway():
             raise HTTPException(400, "ratio must be 16:9, 9:16 or 1:1; quality fast or hd")
         if job.room not in ("wan", "ltx", "wanhd", "lipsync", "headswap"):
             raise HTTPException(400, "room must be wan, ltx, wanhd, lipsync or headswap")
-        seconds = max(1, min(MAX_SECONDS, job.seconds))
+        seconds = max(1, min(HEADSWAP_MAX_SECONDS if job.room == "headswap" else MAX_SECONDS, job.seconds))
         image = raw(job.image, 14_000_000)  # about 10 MB of picture
         negative = (job.negative_prompt or "").strip()[:600]
 
@@ -671,9 +898,10 @@ def gateway():
 
         if job.room == "headswap":
             video = raw(job.video, 52_000_000)
-            if not image or not video:
-                raise HTTPException(400, "headswap needs a clip (video) and a photo of the new face (image)")
-            call = Headswap().make.spawn(prompt, video, image, seconds, job.quality)
+            photos = [p for p in (raw(x, 14_000_000) for x in (job.images or [])[:HS_MAX_PEOPLE]) if p] or ([image] if image else [])
+            if not photos or not video:
+                raise HTTPException(400, "headswap needs a clip (video) and a photo of the new face (image, or images for several people)")
+            call = Headswap().make.spawn(prompt, video, photos, seconds, job.quality)
             return {"id": call.object_id, "status": "running", "room": "headswap"}
 
         if job.room == "wanhd":
