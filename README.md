@@ -12,7 +12,7 @@ Today it has these rooms (one address and one password for all of them):
 | `ltx` | Start and end picture, video to video, with sound | LTX-2 19B distilled |
 | `wanhd` | Higher quality text or picture to video | Wan 2.2 A14B |
 | `lipsync` | A face photo plus a voice recording gives a talking video | LongCat-Video-Avatar 1.5 |
-| `headswap` | A clip plus a photo of a new face gives the same clip with the head swapped (3 to 5 seconds) | BFS head-swap LoRA on LTX-2.3 (LTX-2 community license) |
+| `headswap` | A clip plus one photo per person gives the same clip with every head swapped (up to 4 people, 3 to 5 seconds). Each head is found and tracked automatically, swapped at a fixed head size, then fitted back to the exact size and position of the original head. Photos match the heads left to right. About 2 minutes per person. | BFS head-swap LoRA on LTX-2.3 (LTX-2 community license) |
 
 Only use footage and photos of people who have agreed to it.
 
@@ -35,4 +35,4 @@ The last command prints an address ending in `.modal.run`. In Syok choose "Free 
 
 ## Direct API (for developers)
 
-`POST /v1/video` with header `Authorization: Bearer <your password>` and JSON `{"prompt": "...", "room": "wan", "image": "<optional data: URL>", "video": "<data: URL, ltx and headswap>", "audio": "<data: URL, lipsync>", "seconds": 5, "ratio": "16:9", "quality": "fast"}` returns `{"id": "..."}`. Then `GET /v1/video/<id>` until `status` is `done` (the clip comes back as a `data:video/mp4;base64,...` string). `GET /v1/status` lists the rooms.
+`POST /v1/video` with header `Authorization: Bearer <your password>` and JSON `{"prompt": "...", "room": "wan", "image": "<optional data: URL>", "video": "<data: URL, ltx and headswap>", "images": ["<data: URL per person, headswap, left to right>"], "audio": "<data: URL, lipsync>", "seconds": 5, "ratio": "16:9", "quality": "fast"}` returns `{"id": "..."}`. Then `GET /v1/video/<id>` until `status` is `done` (the clip comes back as a `data:video/mp4;base64,...` string). `GET /v1/status` lists the rooms.
