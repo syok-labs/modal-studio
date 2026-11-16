@@ -106,6 +106,8 @@ headswap_image = (
                  "opencv-python-headless")
     .run_commands("python -c \"import urllib.request as u; u.urlretrieve('https://huggingface.co/opencv/face_detection_yunet/resolve/main/face_detection_yunet_2023mar.onnx', '/opt/yunet.onnx')\"",
                   "test $(stat -c %s /opt/yunet.onnx) -gt 100000",
+                  "python -c \"import urllib.request as u; u.urlretrieve('https://huggingface.co/opencv/face_recognition_sface/resolve/main/face_recognition_sface_2021dec.onnx', '/opt/sface.onnx')\"",
+                  "test $(stat -c %s /opt/sface.onnx) -gt 10000000",
                   "git clone --depth 1 https://github.com/Lightricks/LTX-2 /opt/ltx2",
                   "cd /opt/ltx2 && pip install -e packages/ltx-core -e packages/ltx-pipelines")
     .env({"HF_HOME": CACHE})
@@ -491,6 +493,7 @@ HS_CROPK = 3.0     # a head crop is 3 face-heights wide: head, hair and the top 
 HS_REFK = 1.7      # the reference photo is cut to 1.7 face-heights: hair to chin
 HS_MAX_PEOPLE = 4
 HS_YUNET = "/opt/yunet.onnx"
+HS_SFACE = "/opt/sface.onnx"   # face recognition: how much does a result look like the photo (0 = stranger, 1 = same)
 HS_YUNET_URL = "https://huggingface.co/opencv/face_detection_yunet/resolve/main/face_detection_yunet_2023mar.onnx"
 
 
@@ -624,7 +627,40 @@ def hs_mask(R):
     return np.clip(cv2.GaussianBlur(m, (s * 2 + 1, s * 2 + 1), s / 2.0), 0, 1)
 
 
-def hs_blend(frames, track, gen_crops, gen_lm, R, mask):
+def hs_embed(img_bgr, rec, det, pick=None):
+    """The identity fingerprint of the face in a picture, or None if no face is found. pick = (x, y) to choose the face nearest that spot."""
+    import cv2
+    import numpy as np
+
+    h, w = img_bgr.shape[:2]
+    det.setInputSize((w, h))
+    _, rows = det.detect(img_bgr)
+    if rows is None or not len(rows):
+        return None
+    if pick is None:
+        row = max(rows, key=lambda r: r[2] * r[3])
+    else:
+        row = min(rows, key=lambda r: (r[0] + r[2] / 2 - pick[0]) ** 2 + (r[1] + r[3] / 2 - pick[1]) ** 2)
+    return rec.feature(rec.alignCrop(img_bgr, row))
+
+
+def hs_identity(photo_bgr, crops, R, rec, det):
+    """How much do the swapped heads look like the photo? Mean similarity over about 8 frames spread through the clip (0 if no face is found)."""
+    import cv2
+    import numpy as np
+
+    ref = hs_embed(photo_bgr, rec, det)
+    if ref is None:
+        return 0.0
+    scores = []
+    for i in np.linspace(0, len(crops) - 1, 8).astype(int):
+        f = hs_embed(crops[i], rec, det, (R / 2, R / 2))
+        if f is not None:
+            scores.append(float(rec.match(ref, f, cv2.FaceRecognizerSF_FR_COSINE)))
+    return float(np.mean(scores)) if len(scores) >= 3 else 0.0
+
+
+def hs_blend(frames, track, gen_crops, gen_lm, R, mask, sharpen=0.0):
     """Put the swapped head of one person back into every frame (in place). frames: list of BGR uint8 arrays, track: that
     person's track from hs_tracks, gen_crops: the generated R x R BGR crops, gen_lm: face landmarks found in those crops (or None).
     The new head is turned, scaled and moved so its eyes, nose and mouth land on the old ones, then blended in with a soft mask."""
@@ -661,6 +697,8 @@ def hs_blend(frames, track, gen_crops, gen_lm, R, mask):
             ok = cv2.warpAffine(np.ones((R, R), np.float32), aligns[i], (R, R), flags=cv2.INTER_LINEAR, borderValue=0)
             ok = cv2.GaussianBlur(cv2.erode(ok, np.ones((7, 7), np.uint8)), (15, 15), 0)   # never blend pixels that were stretched in from outside the picture
             mk = mask * ok
+        if sharpen:   # gentle unsharp mask: the model draws the face a little soft
+            g = cv2.addWeighted(g, 1 + sharpen, cv2.GaussianBlur(g, (0, 0), R / 300), -sharpen, 0)
         gw = cv2.warpAffine(g, inv, (W, H), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
         mw = cv2.warpAffine(mk, inv, (W, H), flags=cv2.INTER_LINEAR)
         ring = (mw > 0.08) & (mw < 0.5)
@@ -780,7 +818,11 @@ class Headswap:
         if not prompt.lstrip().lower().startswith("head_swap"):
             prompt = ("head_swap:\nFACE:\n" + prompt.strip() +
                       "\n\nACTION:\nA person performs the same movements as in the video.")
-        R = 768 if quality == "hd" else 576
+        # quality: "fast" = 1 try at 576 px; "hd" = best of 3 tries at 960 px, a touch of sharpening (slower, costs more, looks better)
+        hd = quality == "hd"
+        R = 960 if hd else 576
+        tries = 3 if hd else 1
+        rec = cv2.FaceRecognizerSF.create(HS_SFACE, "")
         strip = R // 3                      # the green side strip is a quarter of the canvas
         cw, ch = strip + R, R
         mask = hs_mask(R)
@@ -803,15 +845,23 @@ class Headswap:
                 writer.stdin.write(canvas.tobytes())
             writer.stdin.close()
             writer.wait()
-            self._bfs(work, f"{work}/guide{who}.mp4", prompt, cw, ch, n, f"{work}/out{who}.mp4")
-            gen = subprocess.run(["ffmpeg", "-v", "error", "-i", f"{work}/out{who}.mp4", "-f", "rawvideo", "-pix_fmt", "bgr24", "-"],
-                                 capture_output=True).stdout
-            gsz = cw * ch * 3
-            crops = [np.frombuffer(gen[i * gsz:(i + 1) * gsz], np.uint8).reshape(ch, cw, 3)[:, strip:].copy() for i in range(len(gen) // gsz)]
-            if len(crops) < n:
-                raise RuntimeError("the model returned a shorter video than expected")
-            glm = hs_gen_landmarks(crops[:n], R, det)
-            hs_blend(frames, track, crops[:n], glm, R, mask)
+            best, best_score = None, -1.0
+            for t in range(tries):   # every try uses a new random seed; keep the one that looks most like the photo
+                self._bfs(work, f"{work}/guide{who}.mp4", prompt, cw, ch, n, f"{work}/out{who}.mp4")
+                gen = subprocess.run(["ffmpeg", "-v", "error", "-i", f"{work}/out{who}.mp4", "-f", "rawvideo", "-pix_fmt", "bgr24", "-"],
+                                     capture_output=True).stdout
+                gsz = cw * ch * 3
+                crops = [np.frombuffer(gen[i * gsz:(i + 1) * gsz], np.uint8).reshape(ch, cw, 3)[:, strip:].copy() for i in range(len(gen) // gsz)]
+                if len(crops) < n:
+                    raise RuntimeError("the model returned a shorter video than expected")
+                crops = crops[:n]
+                score = hs_identity(photo, crops, R, rec, det) if tries > 1 else 0.0
+                print(f"person {who + 1} try {t + 1}/{tries}: looks like the photo {score:.2f}", flush=True)
+                if best is None or score > best_score:
+                    best, best_score = crops, score
+            crops = best
+            glm = hs_gen_landmarks(crops, R, det)
+            hs_blend(frames, track, crops, glm, R, mask, sharpen=0.35 if hd else 0.0)
 
         raw_out = f"{work}/raw.mp4"
         enc = subprocess.Popen(
