@@ -12,7 +12,7 @@ Today it has these rooms (one address and one password for all of them):
 | `ltx` | Start and end picture, video to video, with sound | LTX-2 19B distilled |
 | `wanhd` | Higher quality text or picture to video | Wan 2.2 A14B |
 | `lipsync` | A face photo plus a voice recording gives a talking video | LongCat-Video-Avatar 1.5 |
-| `headswap` | A clip plus one photo per person gives the same clip with every head swapped (up to 4 people, 3 to 5 seconds). Each head is found and tracked automatically, swapped at a fixed head size, then fitted back to the exact size and position of the original head. Photos match the heads left to right. About 2 minutes per person. | BFS head-swap LoRA on LTX-2.3 (LTX-2 community license) |
+| `headswap` | A clip plus one photo per person gives the same clip with every head swapped (up to 4 people, 3 to 5 seconds). Each head is found and tracked automatically, swapped at a fixed head size, then fitted back to the exact size and position of the original head. Photos match the heads left to right. `quality: "fast"` is one try per person (about 1 to 2 minutes each). `quality: "hd"` draws each head larger, makes 3 tries per person, keeps the one that looks most like the photo and sharpens it slightly (about 2 to 3 minutes per person, costs about 3 times more). | BFS head-swap LoRA on LTX-2.3 (LTX-2 community license) |
 
 Only use footage and photos of people who have agreed to it.
 
