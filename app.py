@@ -103,11 +103,13 @@ headswap_image = (
     modal.Image.debian_slim(python_version="3.12")
     .apt_install("ffmpeg", "git")
     .pip_install("torch==2.8.0", "torchvision==0.23.0", "torchaudio==2.8.0", "pillow", "numpy", "huggingface_hub", "av",
-                 "opencv-python-headless")
+                 "opencv-python-headless", "onnxruntime-gpu==1.22.0")
     .run_commands("python -c \"import urllib.request as u; u.urlretrieve('https://huggingface.co/opencv/face_detection_yunet/resolve/main/face_detection_yunet_2023mar.onnx', '/opt/yunet.onnx')\"",
                   "test $(stat -c %s /opt/yunet.onnx) -gt 100000",
                   "python -c \"import urllib.request as u; u.urlretrieve('https://huggingface.co/opencv/face_recognition_sface/resolve/main/face_recognition_sface_2021dec.onnx', '/opt/sface.onnx')\"",
                   "test $(stat -c %s /opt/sface.onnx) -gt 10000000",
+                  "python -c \"import urllib.request as u; u.urlretrieve('https://huggingface.co/facefusion/models-3.0.0/resolve/main/gfpgan_1.4.onnx', '/opt/gfpgan.onnx')\"",
+                  "test $(stat -c %s /opt/gfpgan.onnx) -gt 300000000",
                   "git clone --depth 1 https://github.com/Lightricks/LTX-2 /opt/ltx2",
                   "cd /opt/ltx2 && pip install -e packages/ltx-core -e packages/ltx-pipelines")
     .env({"HF_HOME": CACHE})
@@ -492,6 +494,7 @@ def fetch_headswap():
 HS_CROPK = 3.0     # a head crop is 3 face-heights wide: head, hair and the top of the shoulders
 HS_REFK = 1.7      # the reference photo is cut to 1.7 face-heights: hair to chin
 HS_MAX_PEOPLE = 4
+HS_MAX_ANGLES = 3   # photos per person (the first one is the main photo, the others are other angles of the same person)
 HS_YUNET = "/opt/yunet.onnx"
 HS_SFACE = "/opt/sface.onnx"   # face recognition: how much does a result look like the photo (0 = stranger, 1 = same)
 HS_YUNET_URL = "https://huggingface.co/opencv/face_detection_yunet/resolve/main/face_detection_yunet_2023mar.onnx"
@@ -627,6 +630,95 @@ def hs_mask(R):
     return np.clip(cv2.GaussianBlur(m, (s * 2 + 1, s * 2 + 1), s / 2.0), 0, 1)
 
 
+HS_GFPGAN = "/opt/gfpgan.onnx"   # face restorer (GFPGAN 1.4): redraws skin, eyes and teeth sharply on the generated face
+HS_GFPGAN_URL = "https://huggingface.co/facefusion/models-3.0.0/resolve/main/gfpgan_1.4.onnx"
+HS_FFHQ = [[0.37691676, 0.46864664], [0.62285697, 0.46912813], [0.50123859, 0.61331904], [0.39308822, 0.72541100], [0.61150205, 0.72490465]]
+
+
+def hs_yaw(lm):
+    """How far a face is turned, from its 5 landmarks: 0 = straight at the camera, negative = turned to the picture's left, positive = to the right."""
+    import numpy as np
+
+    p = np.asarray(lm, dtype=np.float64).reshape(5, 2)
+    mid = p[:2].mean(0)
+    return float((p[2, 0] - mid[0]) / max(float(np.linalg.norm(p[0] - p[1])), 1e-6))
+
+
+def hs_photo_yaw(photo_bgr, detector=None):
+    """The turn of the largest face in a photo (see hs_yaw), or None if no face is found."""
+    faces = hs_faces(photo_bgr, detector)
+    if not faces:
+        return None
+    return hs_yaw(max(faces, key=lambda f: f[2] * f[3])[5])
+
+
+def hs_pick_photos(photos, clip_yaw, detector=None):
+    """Order one person's photos from best to worst angle match for a head that is turned clip_yaw in the clip.
+    Returns (indexes, yaws): photos with no face found go last."""
+    yaws = [hs_photo_yaw(p, detector) for p in photos]
+    order = sorted(range(len(photos)), key=lambda i: 9.0 if yaws[i] is None else abs(yaws[i] - clip_yaw))
+    return order, yaws
+
+
+def hs_restorer():
+    """The GFPGAN session on the GPU, or None if it cannot run there (the swap then simply goes without the face restore)."""
+    try:
+        import onnxruntime as ort
+
+        try:
+            ort.preload_dlls()   # lets onnxruntime find the CUDA libraries that came with torch
+        except Exception:
+            pass
+        sess = ort.InferenceSession(HS_GFPGAN, providers=["CUDAExecutionProvider", "CPUExecutionProvider"])
+        print(f"face restore running on: {sess.get_providers()}", flush=True)
+        if sess.get_providers()[0] != "CUDAExecutionProvider":   # on the CPU it would take many minutes: skip it instead
+            print("face restore skipped: the GPU could not be used for it", flush=True)
+            return None
+        return sess
+    except Exception as exc:
+        print(f"face restore unavailable: {exc}", flush=True)
+        return None
+
+
+def hs_restore(crops, gen_lm, sess, R, strength=0.7):
+    """Sharpen the generated face with GFPGAN. Each crop is turned so the face sits like the standard face template, restored,
+    turned back and mixed in softly (strength 0..1) inside a face-shaped mask; the hair, ears and background are left alone.
+    What the restorer adds is averaged over 3 neighbouring frames so it does not flicker. Returns new crops (same size)."""
+    import cv2
+    import numpy as np
+
+    n = len(crops)
+    tpl = np.array(HS_FFHQ, dtype=np.float32) * 512
+    m512 = np.zeros((512, 512), np.float32)
+    cv2.ellipse(m512, (256, 268), (170, 215), 0, 0, 360, 1.0, -1)
+    m512 = cv2.GaussianBlur(m512, (0, 0), 22)
+    res = [None] * n
+    for i in range(n):
+        m, _ = cv2.estimateAffinePartial2D(gen_lm[i].reshape(5, 2).astype(np.float32), tpl, method=cv2.LMEDS)
+        if m is None:
+            continue
+        face = cv2.warpAffine(crops[i], m, (512, 512), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
+        x = ((face[:, :, ::-1].astype(np.float32) / 255.0 - 0.5) / 0.5).transpose(2, 0, 1)[None]
+        y = sess.run(None, {sess.get_inputs()[0].name: x})[0][0]
+        out = ((np.clip(y, -1, 1).transpose(1, 2, 0) + 1) * 127.5)[:, :, ::-1]
+        inv = cv2.invertAffineTransform(m)
+        back = cv2.warpAffine(out, inv, (R, R), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
+        mk = cv2.warpAffine(m512, inv, (R, R), flags=cv2.INTER_LINEAR)
+        res[i] = (((back - crops[i].astype(np.float32)) * mk[..., None]).astype(np.float16), mk.astype(np.float16))
+    out_crops = []
+    for i in range(n):
+        acc, w = None, 0.0
+        for j, wt in ((i - 1, 0.25), (i, 0.5), (i + 1, 0.25)):
+            if 0 <= j < n and res[j] is not None:
+                acc = res[j][0].astype(np.float32) * wt if acc is None else acc + res[j][0].astype(np.float32) * wt
+                w += wt
+        if acc is None:
+            out_crops.append(crops[i])
+        else:
+            out_crops.append(np.clip(crops[i].astype(np.float32) + strength * acc / w, 0, 255).astype(np.uint8))
+    return out_crops
+
+
 def hs_embed(img_bgr, rec, det, pick=None):
     """The identity fingerprint of the face in a picture, or None if no face is found. pick = (x, y) to choose the face nearest that spot."""
     import cv2
@@ -644,19 +736,21 @@ def hs_embed(img_bgr, rec, det, pick=None):
     return rec.feature(rec.alignCrop(img_bgr, row))
 
 
-def hs_identity(photo_bgr, crops, R, rec, det):
-    """How much do the swapped heads look like the photo? Mean similarity over about 8 frames spread through the clip (0 if no face is found)."""
+def hs_identity(photos, crops, R, rec, det):
+    """How much do the swapped heads look like the person's photo(s)? Mean similarity over about 8 frames spread through the clip,
+    averaged over the photos (0 if no face is found). photos: one BGR picture or a list of them (several angles of the same person)."""
     import cv2
     import numpy as np
 
-    ref = hs_embed(photo_bgr, rec, det)
-    if ref is None:
+    photos = photos if isinstance(photos, list) else [photos]
+    refs = [r for r in (hs_embed(p, rec, det) for p in photos) if r is not None]
+    if not refs:
         return 0.0
     scores = []
     for i in np.linspace(0, len(crops) - 1, 8).astype(int):
         f = hs_embed(crops[i], rec, det, (R / 2, R / 2))
         if f is not None:
-            scores.append(float(rec.match(ref, f, cv2.FaceRecognizerSF_FR_COSINE)))
+            scores.append(float(np.mean([rec.match(r, f, cv2.FaceRecognizerSF_FR_COSINE) for r in refs])))
     return float(np.mean(scores)) if len(scores) >= 3 else 0.0
 
 
@@ -757,7 +851,15 @@ class Headswap:
             raise RuntimeError(f"head swap failed (exit {r.returncode}): " + "\n".join(keep)[-1500:])
 
     @modal.method()
-    def make(self, prompt: str, video_b64: str, images_b64: list, seconds: int = 5, quality: str = "fast") -> bytes:
+    def restore_probe(self) -> str:
+        """A quick check (no clip needed): can the face restorer run on the GPU here?"""
+        import onnxruntime as ort
+
+        sess = hs_restorer()
+        return f"onnxruntime {ort.__version__}; available {ort.get_available_providers()}; restorer {'GPU ok' if sess is not None else 'not on GPU'}"
+
+    @modal.method()
+    def make(self, prompt: str, video_b64: str, images_b64: list, seconds: int = 5, quality: str = "fast", groups: list | None = None) -> bytes:
         import shutil
         import subprocess
 
@@ -770,7 +872,7 @@ class Headswap:
         with open(f"{work}/in.bin", "wb") as fh:
             fh.write(base64.b64decode(video_b64))
         photos = []
-        for b in (images_b64 or [])[:HS_MAX_PEOPLE]:
+        for b in (images_b64 or [])[:HS_MAX_PEOPLE * HS_MAX_ANGLES]:
             arr = np.frombuffer(base64.b64decode(b), np.uint8)
             img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
             if img is None:
@@ -778,6 +880,15 @@ class Headswap:
             photos.append(img)
         if not photos:
             raise RuntimeError("add at least one photo of the new face")
+        # groups = how many photos belong to each person (the extra photos are other angles of the same person); without it, one photo = one person
+        sizes = [int(g) for g in (groups or [])]
+        if not (sizes and len(sizes) <= HS_MAX_PEOPLE and all(1 <= g <= HS_MAX_ANGLES for g in sizes) and sum(sizes) == len(photos)):
+            photos = photos[:HS_MAX_PEOPLE]
+            sizes = [1] * len(photos)
+        people, k = [], 0
+        for g in sizes:
+            people.append(photos[k:k + g])
+            k += g
 
         def run(cmd):
             r = subprocess.run(cmd, capture_output=True, text=True)
@@ -812,8 +923,8 @@ class Headswap:
         tracks = hs_tracks(dets, n)
         if not tracks:
             raise RuntimeError("no face found in the clip. Use a clip where the face is clearly visible (not tiny, not turned away).")
-        if len(photos) > len(tracks):
-            raise RuntimeError(f"found {len(tracks)} {'person' if len(tracks) == 1 else 'people'} in the clip but you gave {len(photos)} photos. "
+        if len(people) > len(tracks):
+            raise RuntimeError(f"found {len(tracks)} {'person' if len(tracks) == 1 else 'people'} in the clip but you gave photos of {len(people)} people. "
                                "Remove the extra photos, or use a clip where every head is clearly visible.")
         if not prompt.lstrip().lower().startswith("head_swap"):
             prompt = ("head_swap:\nFACE:\n" + prompt.strip() +
@@ -826,10 +937,11 @@ class Headswap:
         strip = R // 3                      # the green side strip is a quarter of the canvas
         cw, ch = strip + R, R
         mask = hs_mask(R)
-        source = [f.copy() for f in frames] if len(photos) > 1 else frames
-        for who, photo in enumerate(photos):   # people are numbered left to right
-            track = tracks[who]
-            tbox = track["box"]
+        source = [f.copy() for f in frames] if len(people) > 1 else frames
+        sess = hs_restorer()   # the face restorer (None if it could not be loaded: the swap still works without it)
+
+        def make_guide(who, track, photo, path):
+            """The guide video for one person and one reference photo: new face on the green strip, the head crop beside it."""
             ref = hs_reference(photo, strip - 24, det)
             canvas = np.zeros((ch, cw, 3), np.uint8)
             canvas[:, :strip] = (0, 255, 0)
@@ -837,17 +949,30 @@ class Headswap:
             canvas[y0:y0 + ref.shape[0], 12:12 + ref.shape[1]] = ref
             writer = subprocess.Popen(
                 ["ffmpeg", "-y", "-v", "error", "-f", "rawvideo", "-pix_fmt", "bgr24", "-s", f"{cw}x{ch}", "-r", str(FPS),
-                 "-i", "-", "-c:v", "libx264", "-crf", "14", "-pix_fmt", "yuv420p", f"{work}/guide{who}.mp4"],
+                 "-i", "-", "-c:v", "libx264", "-crf", "14", "-pix_fmt", "yuv420p", path],
                 stdin=subprocess.PIPE)
             for i in range(n):
-                m = hs_crop_matrix(tbox[i], R)
+                m = hs_crop_matrix(track["box"][i], R)
                 canvas[:, strip:] = cv2.warpAffine(source[i], m, (R, R), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
                 writer.stdin.write(canvas.tobytes())
             writer.stdin.close()
             writer.wait()
+
+        for who, person in enumerate(people):   # people are numbered left to right
+            track = tracks[who]
+            # which photo to use: the one whose head turn is closest to how this person's head is turned in the clip
+            clip_yaw = float(np.median([hs_yaw(track["lm"][i]) for i in range(n)]))
+            order, yaws = hs_pick_photos(person, clip_yaw, det)
+            print(f"person {who + 1}: head turn in the clip {clip_yaw:+.2f}; photo turns " +
+                  ", ".join("none" if y is None else f"{y:+.2f}" for y in yaws) + f"; best match = photo {order[0] + 1}", flush=True)
+            guides = {}
             best, best_score = None, -1.0
-            for t in range(tries):   # every try uses a new random seed; keep the one that looks most like the photo
-                self._bfs(work, f"{work}/guide{who}.mp4", prompt, cw, ch, n, f"{work}/out{who}.mp4")
+            for t in range(tries):   # every try uses a new random seed (and, if there are several photos, the next best angle); keep the one that looks most like the person
+                pi = order[t % len(order)]
+                if pi not in guides:
+                    guides[pi] = f"{work}/guide{who}_{pi}.mp4"
+                    make_guide(who, track, person[pi], guides[pi])
+                self._bfs(work, guides[pi], prompt, cw, ch, n, f"{work}/out{who}.mp4")
                 gen = subprocess.run(["ffmpeg", "-v", "error", "-i", f"{work}/out{who}.mp4", "-f", "rawvideo", "-pix_fmt", "bgr24", "-"],
                                      capture_output=True).stdout
                 gsz = cw * ch * 3
@@ -855,13 +980,24 @@ class Headswap:
                 if len(crops) < n:
                     raise RuntimeError("the model returned a shorter video than expected")
                 crops = crops[:n]
-                score = hs_identity(photo, crops, R, rec, det) if tries > 1 else 0.0
-                print(f"person {who + 1} try {t + 1}/{tries}: looks like the photo {score:.2f}", flush=True)
+                score = hs_identity(person, crops, R, rec, det) if tries > 1 else 0.0
+                print(f"person {who + 1} try {t + 1}/{tries} (photo {pi + 1}): looks like the photo(s) {score:.2f}", flush=True)
                 if best is None or score > best_score:
                     best, best_score = crops, score
             crops = best
             glm = hs_gen_landmarks(crops, R, det)
-            hs_blend(frames, track, crops, glm, R, mask, sharpen=0.35 if hd else 0.0)
+            restored = False
+            if sess is not None and glm is not None:   # redraw the face sharply; kept only if it still looks like the person
+                try:
+                    before = best_score if tries > 1 else hs_identity(person, crops, R, rec, det)
+                    sharp = hs_restore(crops, glm, sess, R, 0.7)
+                    after = hs_identity(person, sharp, R, rec, det)
+                    print(f"person {who + 1} face restore: looks like the photo(s) {before:.2f} -> {after:.2f}", flush=True)
+                    if after >= before - 0.04:
+                        crops, restored = sharp, True
+                except Exception as exc:
+                    print(f"person {who + 1} face restore skipped: {exc}", flush=True)
+            hs_blend(frames, track, crops, glm, R, mask, sharpen=(0.15 if restored else 0.35) if hd else 0.0)
 
         raw_out = f"{work}/raw.mp4"
         enc = subprocess.Popen(
@@ -909,7 +1045,8 @@ def gateway():
         ratio: str = "16:9"
         quality: str = "fast"
         audio: str | None = None  # room lipsync only: the voice recording (data: URL), 15 s are used at most
-        images: list[str] | None = None  # room headswap only: one new-face photo per person in the clip, left to right
+        images: list[str] | None = None  # room headswap only: new-face photos, one person after another, left to right
+        groups: list[int] | None = None  # room headswap only: how many of the photos belong to each person (extra angles); default one each
         negative_prompt: str | None = None  # "do not show" list (Wan rooms; LTX distilled ignores it)
 
     def raw(x, limit):
@@ -948,10 +1085,10 @@ def gateway():
 
         if job.room == "headswap":
             video = raw(job.video, 52_000_000)
-            photos = [p for p in (raw(x, 14_000_000) for x in (job.images or [])[:HS_MAX_PEOPLE]) if p] or ([image] if image else [])
+            photos = [p for p in (raw(x, 14_000_000) for x in (job.images or [])[:HS_MAX_PEOPLE * HS_MAX_ANGLES]) if p] or ([image] if image else [])
             if not photos or not video:
                 raise HTTPException(400, "headswap needs a clip (video) and a photo of the new face (image, or images for several people)")
-            call = Headswap().make.spawn(prompt, video, photos, seconds, job.quality)
+            call = Headswap().make.spawn(prompt, video, photos, seconds, job.quality, job.groups)
             return {"id": call.object_id, "status": "running", "room": "headswap"}
 
         if job.room == "wanhd":
