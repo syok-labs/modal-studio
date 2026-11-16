@@ -808,6 +808,64 @@ def hs_blend(frames, track, gen_crops, gen_lm, R, mask, sharpen=0.0):
         frames[i][:] = np.clip(frames[i].astype(np.float32) * (1 - a) + gf * a, 0, 255).astype(np.uint8)
 
 
+HS_PIECE = 73      # frames in one piece (3 s + 1: the model wants 8 x n + 1 frames)
+HS_STEP = 60       # a new piece starts at most this many frames after the last one, so neighbours always overlap by 13 frames or more
+HS_XFADE = 12      # neighbouring pieces are blended over half a second
+
+
+def hs_spans(n):
+    """Split n frames into pieces of HS_PIECE frames that overlap. A clip of one piece or less stays whole."""
+    import math
+
+    if n <= HS_PIECE:
+        return [(0, n)]
+    k = math.ceil((n - HS_PIECE) / HS_STEP) + 1
+    starts = [round(i * (n - HS_PIECE) / (k - 1)) for i in range(k)]
+    return [(a, a + HS_PIECE) for a in starts]
+
+
+HS_JUMP_WEIGHT = 2.0   # how much a visible jump from the piece before costs a try, compared with how much it looks like the person
+
+
+def hs_jump(prev_crops, prev_span, crops, span, mask):
+    """How different is a new piece from the piece before it where they overlap? Mean pixel difference (0..1) over the head area
+    (face, hair) on the overlapping frames. A big value means a visible jump (other hair, other light) when they are joined."""
+    import numpy as np
+
+    a0, b0 = prev_span
+    a1, b1 = span
+    fr = list(range(a1, min(b0, b1)))[::3]
+    if not fr:
+        return 0.0
+    m = mask > 0.3
+    return float(np.mean([np.abs(prev_crops[f - a0][m].astype(np.float32) - crops[f - a1][m].astype(np.float32)).mean() for f in fr]) / 255.0)
+
+
+def hs_join(pieces, spans, n):
+    """Stitch overlapping pieces (lists of finished frames, one list per span) into one list of n frames: the pieces are
+    cross-faded over HS_XFADE frames in the middle of each overlap. Each piece already has the new head fitted onto the old one
+    (eyes, nose and mouth land in the same place), so the fade only has to mix skin and hair, not two different head positions."""
+    import numpy as np
+
+    cuts = [(spans[i + 1][0] + spans[i][1]) / 2.0 for i in range(len(spans) - 1)]   # the middle of each overlap
+    out = []
+    for f in range(n):
+        parts = []
+        for si, (a, b) in enumerate(spans):
+            if not a <= f < b:
+                continue
+            wl = 1.0 if si == 0 else float(np.clip((f - cuts[si - 1]) / HS_XFADE + 0.5, 0, 1))
+            wr = 1.0 if si == len(spans) - 1 else float(np.clip((cuts[si] - f) / HS_XFADE + 0.5, 0, 1))
+            if wl * wr > 1e-6:
+                parts.append((wl * wr, pieces[si][f - a]))
+        if len(parts) == 1:
+            out.append(parts[0][1])
+        else:
+            tot = sum(w for w, _ in parts)
+            out.append(np.clip(sum(c.astype(np.float32) * (w / tot) for w, c in parts), 0, 255).astype(np.uint8))
+    return out
+
+
 @app.cls(
     image=headswap_image,
     gpu=HEADSWAP_GPU,
@@ -862,6 +920,9 @@ class Headswap:
     def make(self, prompt: str, video_b64: str, images_b64: list, seconds: int = 5, quality: str = "fast", groups: list | None = None) -> bytes:
         import shutil
         import subprocess
+
+        def say(msg):
+            print(msg, flush=True)
 
         import cv2
         import numpy as np
@@ -940,8 +1001,8 @@ class Headswap:
         source = [f.copy() for f in frames] if len(people) > 1 else frames
         sess = hs_restorer()   # the face restorer (None if it could not be loaded: the swap still works without it)
 
-        def make_guide(who, track, photo, path):
-            """The guide video for one person and one reference photo: new face on the green strip, the head crop beside it."""
+        def make_guide(track, photo, path, a, b):
+            """The guide video for one person, one reference photo and frames a..b: new face on the green strip, the head crop beside it."""
             ref = hs_reference(photo, strip - 24, det)
             canvas = np.zeros((ch, cw, 3), np.uint8)
             canvas[:, :strip] = (0, 255, 0)
@@ -951,53 +1012,77 @@ class Headswap:
                 ["ffmpeg", "-y", "-v", "error", "-f", "rawvideo", "-pix_fmt", "bgr24", "-s", f"{cw}x{ch}", "-r", str(FPS),
                  "-i", "-", "-c:v", "libx264", "-crf", "14", "-pix_fmt", "yuv420p", path],
                 stdin=subprocess.PIPE)
-            for i in range(n):
+            for i in range(a, b):
                 m = hs_crop_matrix(track["box"][i], R)
                 canvas[:, strip:] = cv2.warpAffine(source[i], m, (R, R), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
                 writer.stdin.write(canvas.tobytes())
             writer.stdin.close()
             writer.wait()
 
+        spans = hs_spans(n)   # the clip is worked on in pieces of about 3 s (one piece if it is shorter), each piece with its own best photo and best-of-N
+        if len(spans) > 1:
+            say(f"working in {len(spans)} pieces: " + ", ".join(f"{a}-{b}" for a, b in spans))
+
         for who, person in enumerate(people):   # people are numbered left to right
             track = tracks[who]
-            # which photo to use: the one whose head turn is closest to how this person's head is turned in the clip
-            clip_yaw = float(np.median([hs_yaw(track["lm"][i]) for i in range(n)]))
-            order, yaws = hs_pick_photos(person, clip_yaw, det)
-            print(f"person {who + 1}: head turn in the clip {clip_yaw:+.2f}; photo turns " +
-                  ", ".join("none" if y is None else f"{y:+.2f}" for y in yaws) + f"; best match = photo {order[0] + 1}", flush=True)
-            guides = {}
-            best, best_score = None, -1.0
-            for t in range(tries):   # every try uses a new random seed (and, if there are several photos, the next best angle); keep the one that looks most like the person
-                pi = order[t % len(order)]
-                if pi not in guides:
-                    guides[pi] = f"{work}/guide{who}_{pi}.mp4"
-                    make_guide(who, track, person[pi], guides[pi])
-                self._bfs(work, guides[pi], prompt, cw, ch, n, f"{work}/out{who}.mp4")
-                gen = subprocess.run(["ffmpeg", "-v", "error", "-i", f"{work}/out{who}.mp4", "-f", "rawvideo", "-pix_fmt", "bgr24", "-"],
-                                     capture_output=True).stdout
-                gsz = cw * ch * 3
-                crops = [np.frombuffer(gen[i * gsz:(i + 1) * gsz], np.uint8).reshape(ch, cw, 3)[:, strip:].copy() for i in range(len(gen) // gsz)]
-                if len(crops) < n:
-                    raise RuntimeError("the model returned a shorter video than expected")
-                crops = crops[:n]
-                score = hs_identity(person, crops, R, rec, det) if tries > 1 else 0.0
-                print(f"person {who + 1} try {t + 1}/{tries} (photo {pi + 1}): looks like the photo(s) {score:.2f}", flush=True)
-                if best is None or score > best_score:
-                    best, best_score = crops, score
-            crops = best
-            glm = hs_gen_landmarks(crops, R, det)
-            restored = False
-            if sess is not None and glm is not None:   # redraw the face sharply; kept only if it still looks like the person
-                try:
-                    before = best_score if tries > 1 else hs_identity(person, crops, R, rec, det)
-                    sharp = hs_restore(crops, glm, sess, R, 0.7)
-                    after = hs_identity(person, sharp, R, rec, det)
-                    print(f"person {who + 1} face restore: looks like the photo(s) {before:.2f} -> {after:.2f}", flush=True)
-                    if after >= before - 0.04:
-                        crops, restored = sharp, True
-                except Exception as exc:
-                    print(f"person {who + 1} face restore skipped: {exc}", flush=True)
-            hs_blend(frames, track, crops, glm, R, mask, sharpen=(0.15 if restored else 0.35) if hd else 0.0)
+            pieces = []
+            prev_raw, prev_span = None, None
+            for si, (a, b) in enumerate(spans):
+                ln = b - a
+                # which photo to use: the one whose head turn is closest to how this person's head is turned in this piece of the clip
+                clip_yaw = float(np.median([hs_yaw(track["lm"][i]) for i in range(a, b)]))
+                order, yaws = hs_pick_photos(person, clip_yaw, det)
+                say(f"person {who + 1} piece {si + 1}/{len(spans)}: head turn {clip_yaw:+.2f}; photo turns " +
+                      ", ".join("none" if y is None else f"{y:+.2f}" for y in yaws) + f"; best match = photo {order[0] + 1}")
+                guides = {}
+                best, best_score = None, -1.0
+                for t in range(tries):   # every try uses a new random seed (and, if there are several photos, the next best angle); keep the one that looks most like the person
+                    pi = order[t % len(order)]
+                    if pi not in guides:
+                        guides[pi] = f"{work}/guide{who}_{si}_{pi}.mp4"
+                        make_guide(track, person[pi], guides[pi], a, b)
+                    self._bfs(work, guides[pi], prompt, cw, ch, ln, f"{work}/out{who}.mp4")
+                    gen = subprocess.run(["ffmpeg", "-v", "error", "-i", f"{work}/out{who}.mp4", "-f", "rawvideo", "-pix_fmt", "bgr24", "-"],
+                                         capture_output=True).stdout
+                    gsz = cw * ch * 3
+                    crops = [np.frombuffer(gen[i * gsz:(i + 1) * gsz], np.uint8).reshape(ch, cw, 3)[:, strip:].copy() for i in range(len(gen) // gsz)]
+                    if len(crops) < ln:
+                        raise RuntimeError("the model returned a shorter video than expected")
+                    crops = crops[:ln]
+                    ident = hs_identity(person, crops, R, rec, det) if tries > 1 else 0.0
+                    score = ident
+                    note = ""
+                    if tries > 1 and prev_raw is not None:   # a try that looks like the piece before it (same hair, same light) joins to it without a jump
+                        jump = hs_jump(prev_raw, prev_span, crops, (a, b), mask)
+                        score = ident - HS_JUMP_WEIGHT * jump
+                        note = f", jump from the piece before {jump:.3f}"
+                    say(f"person {who + 1} piece {si + 1} try {t + 1}/{tries} (photo {pi + 1}): looks like the photo(s) {ident:.2f}{note}")
+                    if best is None or score > best_score:
+                        best, best_score = crops, score
+                crops = best
+                prev_raw, prev_span = crops, (a, b)
+                glm = hs_gen_landmarks(crops, R, det)
+                restored = False
+                if sess is not None and glm is not None:   # redraw the face sharply; kept only if it still looks like the person
+                    try:
+                        before = hs_identity(person, crops, R, rec, det)
+                        sharp = hs_restore(crops, glm, sess, R, 0.7)
+                        after = hs_identity(person, sharp, R, rec, det)
+                        say(f"person {who + 1} piece {si + 1} face restore: looks like the photo(s) {before:.2f} -> {after:.2f}")
+                        if after >= before - 0.04:
+                            crops, restored = sharp, True
+                    except Exception as exc:
+                        say(f"person {who + 1} piece {si + 1} face restore skipped: {exc}")
+                sharpen = (0.15 if restored else 0.35) if hd else 0.0
+                if len(spans) == 1:
+                    hs_blend(frames, track, crops, glm, R, mask, sharpen=sharpen)
+                else:   # fit this piece's head onto its own copy of the frames; the pieces are cross-faded together afterwards
+                    pf = [frames[i].copy() for i in range(a, b)]
+                    hs_blend(pf, {"box": track["box"][a:b], "lm": track["lm"][a:b]}, crops, glm, R, mask, sharpen=sharpen)
+                    pieces.append(pf)
+            if len(spans) > 1:
+                for i, fr in enumerate(hs_join(pieces, spans, n)):
+                    frames[i][:] = fr
 
         raw_out = f"{work}/raw.mp4"
         enc = subprocess.Popen(
